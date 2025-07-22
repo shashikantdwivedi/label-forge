@@ -47,6 +47,7 @@ export default function LabelForge() {
   const [showGrid, setShowGrid] = useState(true)
   const [showRulers, setShowRulers] = useState(true)
   const [generatedCode, setGeneratedCode] = useState("")
+  const [printerLanguage, setPrinterLanguage] = useState<"zpl" | "tspl">("zpl")
   const canvasRef = useRef<HTMLDivElement>(null)
 
   const handleElementUpdate = (id: number, newProps: Partial<Element>) => {
@@ -124,7 +125,8 @@ export default function LabelForge() {
       const yPos = Math.round(el.y)
       switch (el.type) {
         case "text":
-          const rotationCode = { 0: "N", 90: "R", 180: "I", 270: "B" }[el.rotation] || "N"
+          const rotationMap = { 0: "N", 90: "R", 180: "I", 270: "B" } as const
+          const rotationCode = rotationMap[el.rotation as keyof typeof rotationMap] || "N"
           const fontWeight = Number.parseInt(el.fontWeight || "400") >= 600 ? "B" : "N" // Bold if weight >= 600
           zpl += `^FO${xPos},${yPos}^A0${rotationCode},${el.fontSize * 1.5},${el.fontSize * 1.5}^FD${el.content}^FS\n`
           break
@@ -139,7 +141,73 @@ export default function LabelForge() {
     })
 
     zpl += "^XZ"
-    setGeneratedCode(zpl)
+    return zpl
+  }
+
+  const generateTSPLCode = () => {
+    let tspl = ""
+    
+    // Label dimensions in dots (203 dpi)
+    const widthDots = Math.round(labelSettings.width * 203)
+    const heightDots = Math.round(labelSettings.height * 203)
+    
+    // TSPL header commands - format based on unit
+    if (labelSettings.unit === "mm") {
+      const widthMm = Math.round(labelSettings.width * 25.4)
+      const heightMm = Math.round(labelSettings.height * 25.4)
+      tspl += `SIZE ${widthMm} mm,${heightMm} mm\n`
+    } else {
+      tspl += `SIZE ${labelSettings.width}",${labelSettings.height}"\n`
+    }
+    
+    // GAP command - format based on unit
+    if (labelSettings.unit === "mm") {
+      tspl += "GAP 3 mm,0 mm\n"
+    } else {
+      tspl += "GAP 0.12\",0\"\n"
+    }
+    tspl += "DIRECTION 1\n"
+    tspl += "REFERENCE 0,0\n"
+    tspl += "OFFSET 0\n"
+    tspl += "SET PEEL OFF\n"
+    tspl += "SET CUTTER OFF\n"
+    tspl += "SET PARTIAL_CUTTER OFF\n"
+    tspl += "SET TEAR ON\n"
+    tspl += "CLS\n"
+
+    elements.forEach((el) => {
+      const xPos = Math.round(el.x)
+      const yPos = Math.round(el.y)
+      
+      switch (el.type) {
+        case "text":
+          // TSPL text rotation: 0, 90, 180, 270
+          const rotation = el.rotation || 0
+          const fontSize = el.fontSize || 14
+          // TSPL font sizes: 1-8, we'll map fontSize to these
+          const tsplFontSize = Math.min(8, Math.max(1, Math.round(fontSize / 4)))
+          tspl += `TEXT ${xPos},${yPos},"${tsplFontSize}",${rotation},1,1,"${el.content}"\n`
+          break
+        case "barcode":
+          // TSPL barcode - Code 128 example
+          const barcodeHeight = el.height || 40
+          tspl += `BARCODE ${xPos},${yPos},"128",${barcodeHeight},1,0,2,2,"${el.data}"\n`
+          break
+        case "qr":
+          // TSPL QR code
+          const qrSize = Math.min(10, Math.max(1, Math.round((el.width || 64) / 10)))
+          tspl += `QRCODE ${xPos},${yPos},L,${qrSize},A,0,"${el.data}"\n`
+          break
+      }
+    })
+
+    tspl += "PRINT 1,1\n"
+    return tspl
+  }
+
+  const generateCode = () => {
+    const code = printerLanguage === "zpl" ? generateZPLCode() : generateTSPLCode()
+    setGeneratedCode(code)
   }
 
   const createNewElement = (type: "text" | "barcode" | "qr" | "image", x = 20, y = 20): Element => {
@@ -224,105 +292,231 @@ export default function LabelForge() {
     setSelectedElement(null)
   }
 
-  const loadDesignFromCode = (code: string) => {
+  const parseZPLCode = (code: string) => {
+    const lines = code.split("\n")
+    const newElements: Element[] = []
+    let labelWidth = 4
+    let labelHeight = 3
+
+    lines.forEach((line, index) => {
+      // Parse label dimensions
+      if (line.startsWith("^PW")) {
+        labelWidth = Number.parseInt(line.substring(3)) / 203 // Convert from dots to inches
+      }
+      if (line.startsWith("^LL")) {
+        labelHeight = Number.parseInt(line.substring(3)) / 203 // Convert from dots to inches
+      }
+
+      // Parse text elements
+      if (line.includes("^FO") && line.includes("^A0")) {
+        const foMatch = line.match(/\^FO(\d+),(\d+)/)
+        const fdMatch = line.match(/\^FD([^^]+)\^FS/)
+        const fontMatch = line.match(/\^A0[NRIB],(\d+),(\d+)/)
+
+        if (foMatch && fdMatch) {
+          const element: Element = {
+            id: Date.now() + index,
+            type: "text",
+            x: Number.parseInt(foMatch[1]),
+            y: Number.parseInt(foMatch[2]),
+            content: fdMatch[1],
+            fontSize: fontMatch ? Number.parseInt(fontMatch[1]) / 1.5 : 14,
+            fontFamily: "Arial",
+            fontWeight: "400",
+            rotation: 0,
+            width: 100,
+            height: 20,
+          }
+          newElements.push(element)
+        }
+      }
+
+      // Parse barcode elements
+      if (line.includes("^FO") && line.includes("^BC")) {
+        const foMatch = line.match(/\^FO(\d+),(\d+)/)
+        const fdMatch = line.match(/\^FD([^^]+)\^FS/)
+        const byMatch = line.match(/\^BY\d+,\d+,(\d+)/)
+
+        if (foMatch && fdMatch) {
+          const element: Element = {
+            id: Date.now() + index + 1000,
+            type: "barcode",
+            x: Number.parseInt(foMatch[1]),
+            y: Number.parseInt(foMatch[2]),
+            data: fdMatch[1],
+            barcodeType: "Code 128",
+            width: 120,
+            height: byMatch ? Number.parseInt(byMatch[1]) : 40,
+          }
+          newElements.push(element)
+        }
+      }
+
+      // Parse QR code elements
+      if (line.includes("^FO") && line.includes("^BQ")) {
+        const foMatch = line.match(/\^FO(\d+),(\d+)/)
+        const fdMatch = line.match(/\^FDQA,([^^]+)\^FS/)
+
+        if (foMatch && fdMatch) {
+          const element: Element = {
+            id: Date.now() + index + 2000,
+            type: "qr",
+            x: Number.parseInt(foMatch[1]),
+            y: Number.parseInt(foMatch[2]),
+            data: fdMatch[1],
+            width: 64,
+            height: 64,
+          }
+          newElements.push(element)
+        }
+      }
+    })
+
+    return { elements: newElements, labelWidth, labelHeight, unit: "in" }
+  }
+
+  const parseTSPLCode = (code: string) => {
+    const lines = code.split("\n")
+    const newElements: Element[] = []
+    let labelWidth = 4
+    let labelHeight = 3
+    let detectedUnit = "in"
+
+    lines.forEach((line, index) => {
+      const trimmedLine = line.trim()
+      
+      // Parse label dimensions
+      if (trimmedLine.startsWith("SIZE")) {
+        // Handle both inch and mm formats
+        const sizeInchMatch = trimmedLine.match(/SIZE\s+([\d.]+)"\s*,?\s*([\d.]+)"/)
+        const sizeMmMatch = trimmedLine.match(/SIZE\s+([\d.]+)\s*mm\s*,\s*([\d.]+)\s*mm/)
+        const sizeGenericMatch = trimmedLine.match(/SIZE\s+([\d.]+)\s*,?\s*([\d.]+)/)
+        
+        if (sizeInchMatch) {
+          labelWidth = Number.parseFloat(sizeInchMatch[1])
+          labelHeight = Number.parseFloat(sizeInchMatch[2])
+          detectedUnit = "in"
+        } else if (sizeMmMatch) {
+          labelWidth = Number.parseFloat(sizeMmMatch[1]) / 25.4 // Convert mm to inches
+          labelHeight = Number.parseFloat(sizeMmMatch[2]) / 25.4
+          detectedUnit = "mm"
+        } else if (sizeGenericMatch) {
+          // If no unit specified, assume mm for TSPL (common default)
+          labelWidth = Number.parseFloat(sizeGenericMatch[1]) / 25.4
+          labelHeight = Number.parseFloat(sizeGenericMatch[2]) / 25.4
+          detectedUnit = "mm"
+        }
+      }
+
+      // Parse text elements
+      if (trimmedLine.startsWith("TEXT")) {
+        const textMatch = trimmedLine.match(/TEXT\s+(\d+),(\d+),"(\d+)",(\d+),\d+,\d+,"([^"]*)"/)
+        if (textMatch) {
+          const element: Element = {
+            id: Date.now() + index,
+            type: "text",
+            x: Number.parseInt(textMatch[1]),
+            y: Number.parseInt(textMatch[2]),
+            content: textMatch[5],
+            fontSize: Number.parseInt(textMatch[3]) * 4, // Convert TSPL font size back to pixels
+            fontFamily: "Arial",
+            fontWeight: "400",
+            rotation: Number.parseInt(textMatch[4]),
+            width: 100,
+            height: 20,
+          }
+          newElements.push(element)
+        }
+      }
+
+      // Parse barcode elements
+      if (trimmedLine.startsWith("BARCODE")) {
+        const barcodeMatch = trimmedLine.match(/BARCODE\s+(\d+),(\d+),"128",(\d+),\d+,\d+,\d+,\d+,"([^"]*)"/)
+        if (barcodeMatch) {
+          const element: Element = {
+            id: Date.now() + index + 1000,
+            type: "barcode",
+            x: Number.parseInt(barcodeMatch[1]),
+            y: Number.parseInt(barcodeMatch[2]),
+            data: barcodeMatch[4],
+            barcodeType: "Code 128",
+            width: 120,
+            height: Number.parseInt(barcodeMatch[3]),
+          }
+          newElements.push(element)
+        }
+      }
+
+      // Parse QR code elements
+      if (trimmedLine.startsWith("QRCODE")) {
+        const qrMatch = trimmedLine.match(/QRCODE\s+(\d+),(\d+),L,(\d+),A,\d+,"([^"]*)"/)
+        if (qrMatch) {
+          const qrSize = Number.parseInt(qrMatch[3]) * 10 // Convert back to pixels
+          const element: Element = {
+            id: Date.now() + index + 2000,
+            type: "qr",
+            x: Number.parseInt(qrMatch[1]),
+            y: Number.parseInt(qrMatch[2]),
+            data: qrMatch[4],
+            width: qrSize,
+            height: qrSize,
+          }
+          newElements.push(element)
+        }
+      }
+    })
+
+    return { elements: newElements, labelWidth, labelHeight, unit: detectedUnit }
+  }
+
+  const loadDesignFromCode = (code: string, language: "auto" | "zpl" | "tspl" = "auto") => {
     try {
-      // Parse ZPL code and extract elements
-      const lines = code.split("\n")
-      const newElements: Element[] = []
-      let labelWidth = 4
-      let labelHeight = 3
-
-      lines.forEach((line, index) => {
-        // Parse label dimensions
-        if (line.startsWith("^PW")) {
-          labelWidth = Number.parseInt(line.substring(3)) / 203 // Convert from dots to inches
+      let parseResult
+      
+      if (language === "zpl") {
+        // Force ZPL parsing
+        parseResult = parseZPLCode(code)
+        setPrinterLanguage("zpl")
+      } else if (language === "tspl") {
+        // Force TSPL parsing
+        parseResult = parseTSPLCode(code)
+        setPrinterLanguage("tspl")
+      } else {
+        // Auto-detect language based on code content
+        if (code.includes("^XA") && code.includes("^XZ")) {
+          // ZPL code detected
+          parseResult = parseZPLCode(code)
+          setPrinterLanguage("zpl")
+        } else if (code.includes("SIZE") && (code.includes("TEXT") || code.includes("BARCODE") || code.includes("QRCODE"))) {
+          // TSPL code detected
+          parseResult = parseTSPLCode(code)
+          setPrinterLanguage("tspl")
+        } else {
+          throw new Error("Unrecognized code format. Please ensure you're using valid ZPL or TSPL code, or manually select the language.")
         }
-        if (line.startsWith("^LL")) {
-          labelHeight = Number.parseInt(line.substring(3)) / 203 // Convert from dots to inches
-        }
-
-        // Parse text elements
-        if (line.includes("^FO") && line.includes("^A0")) {
-          const foMatch = line.match(/\^FO(\d+),(\d+)/)
-          const fdMatch = line.match(/\^FD([^^]+)\^FS/)
-          const fontMatch = line.match(/\^A0[NRIB],(\d+),(\d+)/)
-
-          if (foMatch && fdMatch) {
-            const element: Element = {
-              id: Date.now() + index,
-              type: "text",
-              x: Number.parseInt(foMatch[1]),
-              y: Number.parseInt(foMatch[2]),
-              content: fdMatch[1],
-              fontSize: fontMatch ? Number.parseInt(fontMatch[1]) / 1.5 : 14,
-              fontFamily: "Arial",
-              fontWeight: "400",
-              rotation: 0,
-              width: 100,
-              height: 20,
-            }
-            newElements.push(element)
-          }
-        }
-
-        // Parse barcode elements
-        if (line.includes("^FO") && line.includes("^BC")) {
-          const foMatch = line.match(/\^FO(\d+),(\d+)/)
-          const fdMatch = line.match(/\^FD([^^]+)\^FS/)
-          const byMatch = line.match(/\^BY\d+,\d+,(\d+)/)
-
-          if (foMatch && fdMatch) {
-            const element: Element = {
-              id: Date.now() + index + 1000,
-              type: "barcode",
-              x: Number.parseInt(foMatch[1]),
-              y: Number.parseInt(foMatch[2]),
-              data: fdMatch[1],
-              barcodeType: "Code 128",
-              width: 120,
-              height: byMatch ? Number.parseInt(byMatch[1]) : 40,
-            }
-            newElements.push(element)
-          }
-        }
-
-        // Parse QR code elements
-        if (line.includes("^FO") && line.includes("^BQ")) {
-          const foMatch = line.match(/\^FO(\d+),(\d+)/)
-          const fdMatch = line.match(/\^FDQA,([^^]+)\^FS/)
-
-          if (foMatch && fdMatch) {
-            const element: Element = {
-              id: Date.now() + index + 2000,
-              type: "qr",
-              x: Number.parseInt(foMatch[1]),
-              y: Number.parseInt(foMatch[2]),
-              data: fdMatch[1],
-              width: 64,
-              height: 64,
-            }
-            newElements.push(element)
-          }
-        }
-      })
+      }
 
       // Update state with parsed elements and dimensions
-      setElements(newElements)
+      setElements(parseResult.elements)
       setLabelSettings({
-        width: Math.max(labelWidth, 1),
-        height: Math.max(labelHeight, 1),
-        unit: "in",
+        width: Math.max(parseResult.labelWidth, 1),
+        height: Math.max(parseResult.labelHeight, 1),
+        unit: parseResult.unit,
       })
       setSelectedElement(null)
     } catch (error) {
-      console.error("Error parsing ZPL code:", error)
-      alert("Error parsing the provided code. Please check the format and try again.")
+      console.error("Error parsing code:", error)
+      alert(`Error parsing the provided code: ${error instanceof Error ? error.message : "Please check the format and try again."}`)
     }
   }
 
   // Calculate canvas dimensions in pixels
-  const canvasWidthPx = labelSettings.width * 96 // 96 dpi for screen
-  const canvasHeightPx = labelSettings.height * 96
+  // Convert to inches first, then multiply by 96 DPI for screen display
+  const widthInInches = labelSettings.unit === "mm" ? labelSettings.width / 25.4 : labelSettings.width
+  const heightInInches = labelSettings.unit === "mm" ? labelSettings.height / 25.4 : labelSettings.height
+  
+  const canvasWidthPx = Math.max(240, widthInInches * 96) // 96 dpi for screen, minimum 240px
+  const canvasHeightPx = Math.max(180, heightInInches * 96) // minimum 180px
 
   // Generate grid pattern
   const generateGridPattern = () => {
@@ -345,17 +539,40 @@ export default function LabelForge() {
   // Generate ruler marks
   const generateRulerMarks = () => {
     const marks = []
-    const pixelsPerUnit = labelSettings.unit === "in" ? 96 : 96 / 25.4 // 96 DPI for inches, convert for mm
+    
+    // Calculate marks based on actual label dimensions and unit
+    const labelWidth = labelSettings.width
+    const labelHeight = labelSettings.height
+    const unit = labelSettings.unit
+    
+    // Determine appropriate mark intervals based on size and unit
+    const getMarkInterval = (dimension: number, unit: string) => {
+      if (unit === "mm") {
+        if (dimension <= 50) return 10 // 10mm intervals for small labels
+        if (dimension <= 100) return 20 // 20mm intervals for medium labels
+        return 50 // 50mm intervals for large labels
+      } else { // inches
+        if (dimension <= 2) return 0.25 // 1/4 inch intervals for small labels
+        if (dimension <= 6) return 0.5 // 1/2 inch intervals for medium labels
+        return 1 // 1 inch intervals for large labels
+      }
+    }
+    
+    const hInterval = getMarkInterval(labelWidth, unit)
+    const vInterval = getMarkInterval(labelHeight, unit)
 
     // Horizontal ruler marks
-    for (let i = 0; i <= Math.ceil(canvasWidthPx / pixelsPerUnit); i++) {
-      const x = i * pixelsPerUnit
-      if (x <= canvasWidthPx) {
+    const hMarks = Math.ceil(labelWidth / hInterval)
+    for (let i = 0; i <= hMarks; i++) {
+      const value = i * hInterval
+      if (value <= labelWidth) {
+        const x = (value / labelWidth) * canvasWidthPx
+        const displayValue = unit === "mm" ? Math.round(value) : (value % 1 === 0 ? value : value.toFixed(2))
         marks.push(
           <g key={`h-mark-${i}`}>
             <line x1={x} y1={15} x2={x} y2={20} stroke="#6b7280" strokeWidth="1" />
             <text x={x} y={12} fontSize="8" fill="#6b7280" textAnchor="middle" className="select-none">
-              {i}
+              {displayValue}
             </text>
           </g>,
         )
@@ -363,22 +580,25 @@ export default function LabelForge() {
     }
 
     // Vertical ruler marks
-    for (let i = 0; i <= Math.ceil(canvasHeightPx / pixelsPerUnit); i++) {
-      const y = i * pixelsPerUnit
-      if (y <= canvasHeightPx) {
+    const vMarks = Math.ceil(labelHeight / vInterval)
+    for (let i = 0; i <= vMarks; i++) {
+      const value = i * vInterval
+      if (value <= labelHeight) {
+        const y = (value / labelHeight) * canvasHeightPx
+        const displayValue = unit === "mm" ? Math.round(value) : (value % 1 === 0 ? value : value.toFixed(2))
         marks.push(
           <g key={`v-mark-${i}`}>
             <line x1={15} y1={y + 20} x2={20} y2={y + 20} stroke="#6b7280" strokeWidth="1" />
             <text
               x={12}
-              y={y + 23}
+              y={y + 25}
               fontSize="8"
               fill="#6b7280"
               textAnchor="middle"
               className="select-none"
-              transform={`rotate(-90, 12, ${y + 23})`}
+              transform={`rotate(-90, 12, ${y + 25})`}
             >
-              {i}
+              {displayValue}
             </text>
           </g>,
         )
@@ -527,7 +747,32 @@ export default function LabelForge() {
                 </Label>
                 <Select
                   value={labelSettings.unit}
-                  onValueChange={(value) => setLabelSettings({ ...labelSettings, unit: value })}
+                  onValueChange={(value) => {
+                    // Convert dimensions when unit changes
+                    const currentWidth = labelSettings.width
+                    const currentHeight = labelSettings.height
+                    const currentUnit = labelSettings.unit
+                    
+                    let newWidth = currentWidth
+                    let newHeight = currentHeight
+                    
+                    if (currentUnit === "in" && value === "mm") {
+                      // Convert inches to mm
+                      newWidth = Math.round(currentWidth * 25.4 * 10) / 10 // Round to 1 decimal
+                      newHeight = Math.round(currentHeight * 25.4 * 10) / 10
+                    } else if (currentUnit === "mm" && value === "in") {
+                      // Convert mm to inches
+                      newWidth = Math.round(currentWidth / 25.4 * 100) / 100 // Round to 2 decimals
+                      newHeight = Math.round(currentHeight / 25.4 * 100) / 100
+                    }
+                    
+                    setLabelSettings({ 
+                      ...labelSettings, 
+                      unit: value,
+                      width: newWidth,
+                      height: newHeight
+                    })
+                  }}
                 >
                   <SelectTrigger id="label-unit" className="mt-1 text-sm bg-white/70 border-gray-200 h-8">
                     <SelectValue placeholder="Select unit" />
@@ -571,7 +816,7 @@ export default function LabelForge() {
                 <DialogTrigger asChild>
                   <Button
                     className="w-full gradient-bg text-white hover:opacity-90 transition-opacity text-sm h-8"
-                    onClick={generateZPLCode}
+                    onClick={generateCode}
                   >
                     <Code className="w-4 h-4 mr-2" />
                     Generate Code
@@ -586,15 +831,13 @@ export default function LabelForge() {
                       <Label htmlFor="printer-language" className="text-sm font-semibold text-gray-700">
                         Printer Language
                       </Label>
-                      <Select defaultValue="zpl">
+                      <Select value={printerLanguage} onValueChange={(value: "zpl" | "tspl") => setPrinterLanguage(value)}>
                         <SelectTrigger id="printer-language" className="mt-1 text-sm bg-white/70 border-gray-200 h-8">
                           <SelectValue placeholder="Select language" />
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="zpl">ZPL (Zebra)</SelectItem>
-                          <SelectItem value="epl" disabled>
-                            EPL (Eltron)
-                          </SelectItem>
+                          <SelectItem value="tspl">TSPL (TSC)</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
@@ -688,8 +931,6 @@ export default function LabelForge() {
                 style={{
                   width: `${canvasWidthPx}px`,
                   height: `${canvasHeightPx}px`,
-                  minWidth: "240px",
-                  minHeight: "180px",
                 }}
                 onDragOver={handleCanvasDragOver}
                 onDrop={handleCanvasDrop}
@@ -760,7 +1001,7 @@ interface CanvasElementProps {
   isSelected: boolean
   onClick: () => void
   onUpdate: (id: number, newProps: Partial<Element>) => void
-  canvasRef: React.RefObject<HTMLDivElement>
+  canvasRef: React.RefObject<HTMLDivElement | null>
 }
 
 const CanvasElement: FC<CanvasElementProps> = ({ element, isSelected, onClick, onUpdate, canvasRef }) => {
@@ -1271,11 +1512,12 @@ const PropertiesPanel: FC<PropertiesPanelProps> = ({ element, onUpdate, onDelete
 }
 
 interface LoadDesignDialogProps {
-  onLoadDesign: (code: string) => void
+  onLoadDesign: (code: string, language?: "auto" | "zpl" | "tspl") => void
 }
 
 const LoadDesignDialog: FC<LoadDesignDialogProps> = ({ onLoadDesign }) => {
   const [code, setCode] = useState("")
+  const [selectedLanguage, setSelectedLanguage] = useState<"auto" | "zpl" | "tspl">("auto")
   const [isLoading, setIsLoading] = useState(false)
 
   const handleLoad = async () => {
@@ -1286,8 +1528,9 @@ const LoadDesignDialog: FC<LoadDesignDialogProps> = ({ onLoadDesign }) => {
 
     setIsLoading(true)
     try {
-      onLoadDesign(code)
+      onLoadDesign(code, selectedLanguage)
       setCode("")
+      setSelectedLanguage("auto")
     } catch (error) {
       console.error("Error loading design:", error)
     } finally {
@@ -1298,12 +1541,33 @@ const LoadDesignDialog: FC<LoadDesignDialogProps> = ({ onLoadDesign }) => {
   return (
     <div className="space-y-4 py-4">
       <div>
+        <Label htmlFor="import-language" className="text-sm font-semibold text-gray-700">
+          Printer Language
+        </Label>
+        <Select value={selectedLanguage} onValueChange={(value: "auto" | "zpl" | "tspl") => setSelectedLanguage(value)}>
+          <SelectTrigger id="import-language" className="mt-1 text-sm bg-white/70 border-gray-200 h-8">
+            <SelectValue placeholder="Select language" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="auto">Auto-detect</SelectItem>
+            <SelectItem value="zpl">ZPL (Zebra)</SelectItem>
+            <SelectItem value="tspl">TSPL (TSC)</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div>
         <Label htmlFor="import-code" className="text-sm font-semibold text-gray-700">
-          Paste ZPL Code
+          Paste Code
         </Label>
         <Textarea
           id="import-code"
-          placeholder="Paste your ZPL code here..."
+          placeholder={
+            selectedLanguage === "auto" 
+              ? "Paste your ZPL or TSPL code here... (Language will be auto-detected)"
+              : selectedLanguage === "zpl"
+              ? "Paste your ZPL code here..."
+              : "Paste your TSPL code here..."
+          }
           value={code}
           onChange={(e) => setCode(e.target.value)}
           className="mt-1 h-64 code-font text-xs bg-gray-900 text-green-400 border-gray-700 placeholder:text-green-600/50 resize-none"
